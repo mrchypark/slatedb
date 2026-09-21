@@ -1302,7 +1302,11 @@ impl<'b> DbFlatBufferBuilder<'b> {
         };
 
         let tree = self.add_lsm_tree_v2(&core.tree);
-        let segments = self.add_segments(&core.segments);
+        let segments = if core.segments.is_empty() {
+            None
+        } else {
+            Some(self.add_segments(&core.segments))
+        };
         let segment_extractor_name = core
             .segment_extractor_name
             .as_ref()
@@ -1351,7 +1355,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 last_l0_seq: core.last_l0_seq,
                 recent_snapshot_min_seq: core.recent_snapshot_min_seq,
                 sequence_tracker: Some(sequence_tracker),
-                segments: Some(segments),
+                segments,
                 segment_extractor_name,
             },
         );
@@ -1697,6 +1701,18 @@ mod tests {
 
         // then:
         assert_eq!(manifest, decoded);
+    }
+
+    #[test]
+    fn test_manifest_v2_omits_empty_segments() {
+        let manifest = Manifest::initial(ManifestCore::new());
+        let codec = FlatBufferManifestCodec {};
+        let bytes = codec.encode(&manifest);
+        let wire = flatbuffers::root::<super::ManifestV2>(&bytes[2..]).unwrap();
+        assert!(wire.segments().is_none());
+        assert_eq!(codec.decode(&bytes).unwrap(), manifest);
+        // The same empty manifest used 130 bytes with an empty segment vector.
+        assert!(bytes.len() < 130, "encoded length: {}", bytes.len());
     }
 
     #[test]
