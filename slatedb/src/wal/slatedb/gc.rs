@@ -1,3 +1,4 @@
+use crate::config::GarbageCollectorDirectoryOptions;
 use crate::db_state::SsTableId;
 use crate::garbage_collector::stats::GcStats;
 use crate::garbage_collector::{retain_allowed_by_gc_filter, GcFilter, GC_DELETE_CONCURRENCY};
@@ -43,6 +44,7 @@ pub(crate) struct SlateDbWalGc {
     table_store: Arc<TableStore>,
     stats: Arc<GcStats>,
     mode: WalGcMode,
+    fence_options: Option<GarbageCollectorDirectoryOptions>,
     gc_filter: Option<Arc<dyn GcFilter>>,
     system_clock: Arc<dyn SystemClock>,
 }
@@ -67,9 +69,15 @@ impl SlateDbWalGc {
             table_store,
             stats,
             mode,
+            fence_options: None,
             gc_filter,
             system_clock,
         }
+    }
+
+    pub(crate) fn with_fence_options(mut self, options: GarbageCollectorDirectoryOptions) -> Self {
+        self.fence_options = Some(options);
+        self
     }
 
     fn is_wal_sst_eligible_for_deletion(
@@ -148,22 +156,16 @@ impl SlateDbWalGc {
             })
             .await;
     }
-}
-
-#[async_trait]
-impl WalGc for SlateDbWalGc {
-    async fn collect(
+    async fn collect_listed(
         &self,
-        referenced_ranges: Vec<WalFileRange>,
+        wals: Vec<IdentifiedObjectMetadata<SsTableId>>,
+        referenced_ranges: &[WalFileRange],
+        utc_now: DateTime<Utc>,
         min_age: Duration,
         dry_run: bool,
-    ) -> Result<(), WalError> {
-        let utc_now = self.system_clock.now();
+    ) {
         let min_age = self.wal_sst_min_age(min_age);
-        let ssts_to_delete = self
-            .table_store
-            .list_wal_ssts(..)
-            .await?
+        let ssts_to_delete = wals
             .into_iter()
             .filter(|wal_sst| match self.mode {
                 // In regular mode, only consider WAL SSTs with size > 0 for deletion.
@@ -176,7 +178,7 @@ impl WalGc for SlateDbWalGc {
                     &utc_now,
                     wal_sst,
                     &min_age,
-                    &referenced_ranges,
+                    referenced_ranges,
                 )
             })
             .collect::<Vec<_>>();
@@ -187,6 +189,42 @@ impl WalGc for SlateDbWalGc {
             .collect::<Vec<_>>();
 
         self.maybe_delete_wal_ssts(sst_ids_to_delete, dry_run).await;
+    }
+}
+
+#[async_trait]
+impl WalGc for SlateDbWalGc {
+    async fn collect(
+        &self,
+        referenced_ranges: Vec<WalFileRange>,
+        min_age: Duration,
+        dry_run: bool,
+    ) -> Result<(), WalError> {
+        let utc_now = self.system_clock.now();
+        let wals = self.table_store.list_wal_ssts(..).await?;
+        if let Some(options) = self.fence_options {
+            // Both policies use this cycle's snapshot. Nothing is cached across cycles.
+            let (regular, fences) = wals.into_iter().partition(|wal| wal.metadata.size > 0);
+            self.collect_listed(regular, &referenced_ranges, utc_now, min_age, dry_run)
+                .await;
+            let fence_gc = Self {
+                mode: WalGcMode::Fence,
+                fence_options: None,
+                ..self.clone()
+            };
+            fence_gc
+                .collect_listed(
+                    fences,
+                    &referenced_ranges,
+                    utc_now,
+                    options.min_age,
+                    options.dry_run,
+                )
+                .await;
+        } else {
+            self.collect_listed(wals, &referenced_ranges, utc_now, min_age, dry_run)
+                .await;
+        }
 
         Ok(())
     }
@@ -206,6 +244,234 @@ mod tests {
     use slatedb_common::clock::MockSystemClock;
     use slatedb_common::metrics::MetricsRecorderHelper;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn combined_cycle_lists_once_and_keeps_separate_policies() {
+        use crate::test_utils::FlakyObjectStore;
+        use slatedb_common::metrics::{lookup_metric_with_labels, DefaultMetricsRecorder};
+
+        for (regular_dry_run, fence_dry_run, fence_min_age, expected) in [
+            (false, false, Duration::ZERO, vec![1, 4]),
+            (false, true, Duration::ZERO, vec![1, 2, 4]),
+            (true, false, Duration::ZERO, vec![1, 3, 4]),
+            (false, false, Duration::from_secs(3600), vec![1, 2, 4]),
+        ] {
+            let object_store = Arc::new(FlakyObjectStore::new(Arc::new(InMemory::new()), 0));
+            let wal_store = Arc::new(TableStore::new(
+                ObjectStores::new(object_store.clone(), None),
+                SsTableFormat::default(),
+                Path::from("/"),
+                None,
+                TableStoreKind::GC,
+                BlockCachePolicy::default(),
+            ));
+            let clock = Arc::new(MockSystemClock::new());
+            write_regular_wal(&wal_store, 1).await;
+            write_fence_wal(&wal_store, 2).await;
+            write_regular_wal(&wal_store, 3).await;
+            write_fence_wal(&wal_store, 4).await;
+            make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
+            let recorder = Arc::new(DefaultMetricsRecorder::new());
+            let stats = Arc::new(GcStats::new(&MetricsRecorderHelper::new(
+                recorder.clone(),
+                Default::default(),
+            )));
+            let collector = SlateDbWalGc::new(
+                wal_store.clone(),
+                stats,
+                WalGcMode::Regular,
+                None,
+                clock.clone(),
+            );
+            let fence_collector = SlateDbWalGc {
+                mode: WalGcMode::Fence,
+                ..collector.clone()
+            };
+            let before = object_store.list_attempts();
+            collector
+                .collect(protect_outer_wals(), Duration::ZERO, true)
+                .await
+                .unwrap();
+            fence_collector
+                .collect(protect_outer_wals(), Duration::ZERO, true)
+                .await
+                .unwrap();
+            assert_eq!(object_store.list_attempts() - before, 2);
+
+            let combined = collector.with_fence_options(GarbageCollectorDirectoryOptions {
+                interval: None,
+                min_age: fence_min_age,
+                dry_run: fence_dry_run,
+            });
+            let before = object_store.list_attempts();
+            combined
+                .collect(protect_outer_wals(), Duration::ZERO, regular_dry_run)
+                .await
+                .unwrap();
+            assert_eq!(object_store.list_attempts() - before, 1);
+            assert_eq!(wal_ids(&wal_store).await, expected);
+            for (resource, deleted) in [
+                ("wal", i64::from(!regular_dry_run)),
+                (
+                    "wal_fence",
+                    i64::from(!fence_dry_run && fence_min_age.is_zero()),
+                ),
+            ] {
+                assert_eq!(
+                    lookup_metric_with_labels(
+                        &recorder,
+                        crate::garbage_collector::stats::DELETED_COUNT,
+                        &[("resource", resource)],
+                    ),
+                    Some(deleted)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn combined_cycle_does_not_delete_from_a_partial_listing() {
+        use crate::test_utils::FlakyObjectStore;
+        let object_store =
+            Arc::new(FlakyObjectStore::new(Arc::new(InMemory::new()), 0).with_list_failures(1, 1));
+        let wal_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store.clone(), None),
+            SsTableFormat::default(),
+            Path::from("/"),
+            None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
+        ));
+        write_regular_wal(&wal_store, 1).await;
+        write_fence_wal(&wal_store, 2).await;
+        let clock = Arc::new(MockSystemClock::new());
+        clock.set(Utc::now().timestamp_millis() + 10_000);
+        let collector = build_collector(wal_store.clone(), clock, WalGcMode::Regular)
+            .with_fence_options(GarbageCollectorDirectoryOptions {
+                interval: None,
+                min_age: Duration::ZERO,
+                dry_run: false,
+            });
+        assert!(collector
+            .collect(vec![], Duration::ZERO, false)
+            .await
+            .is_err());
+        assert_eq!(object_store.list_attempts(), 1);
+        assert_eq!(wal_ids(&wal_store).await, vec![1, 2]);
+        collector
+            .collect(vec![], Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert!(wal_ids(&wal_store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn combined_cycle_uses_a_fresh_snapshot_after_concurrent_creation() {
+        use crate::test_utils::FlakyObjectStore;
+        use slatedb_common::ObjectMetadata;
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct AddFenceOnce {
+            store: Arc<TableStore>,
+            added: AtomicBool,
+        }
+        #[async_trait]
+        impl GcFilter for AddFenceOnce {
+            async fn filter(&self, candidates: HashSet<ObjectMetadata>) -> HashSet<ObjectMetadata> {
+                if !self.added.swap(true, Ordering::SeqCst) {
+                    self.store.write_wal_fence(3).await.unwrap();
+                }
+                candidates
+            }
+        }
+        let object_store = Arc::new(FlakyObjectStore::new(Arc::new(InMemory::new()), 0));
+        let wal_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store.clone(), None),
+            SsTableFormat::default(),
+            Path::from("/"),
+            None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
+        ));
+        write_regular_wal(&wal_store, 1).await;
+        write_fence_wal(&wal_store, 2).await;
+        let clock = Arc::new(MockSystemClock::new());
+        clock.set(Utc::now().timestamp_millis() + 10_000);
+        let mut collector = build_collector(wal_store.clone(), clock, WalGcMode::Regular)
+            .with_fence_options(GarbageCollectorDirectoryOptions {
+                interval: None,
+                min_age: Duration::ZERO,
+                dry_run: false,
+            });
+        collector.gc_filter = Some(Arc::new(AddFenceOnce {
+            store: wal_store.clone(),
+            added: AtomicBool::new(false),
+        }));
+        collector
+            .collect(vec![], Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert_eq!(object_store.list_attempts(), 1);
+        assert_eq!(wal_ids(&wal_store).await, vec![3]);
+        let before = object_store.list_attempts();
+        collector
+            .collect(vec![], Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert_eq!(object_store.list_attempts() - before, 1);
+        assert!(wal_ids(&wal_store).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn combined_cycle_keeps_fence_deletes_after_regular_delete_errors() {
+        use crate::test_utils::GatedObjectStore;
+        use slatedb_common::ObjectMetadata;
+        use std::collections::HashSet;
+
+        struct FailRegularDeletes(Arc<GatedObjectStore>);
+        #[async_trait]
+        impl GcFilter for FailRegularDeletes {
+            async fn filter(&self, candidates: HashSet<ObjectMetadata>) -> HashSet<ObjectMetadata> {
+                if candidates.iter().any(|metadata| metadata.size > 0) {
+                    self.0
+                        .delete_stream_gate
+                        .set_error(|| object_store::Error::Generic {
+                            store: "test",
+                            source: std::io::Error::other("delete failed").into(),
+                        });
+                } else {
+                    self.0.delete_stream_gate.clear_error();
+                }
+                candidates
+            }
+        }
+        let object_store = Arc::new(GatedObjectStore::new(Arc::new(InMemory::new())));
+        let wal_store = Arc::new(TableStore::new(
+            ObjectStores::new(object_store.clone(), None),
+            SsTableFormat::default(),
+            Path::from("/"),
+            None,
+            TableStoreKind::GC,
+            BlockCachePolicy::default(),
+        ));
+        write_regular_wal(&wal_store, 1).await;
+        write_fence_wal(&wal_store, 2).await;
+        let clock = Arc::new(MockSystemClock::new());
+        make_all_wals_older_than(&wal_store, &clock, Duration::ZERO).await;
+        let mut collector = build_collector(wal_store.clone(), clock, WalGcMode::Regular)
+            .with_fence_options(GarbageCollectorDirectoryOptions {
+                interval: None,
+                min_age: Duration::ZERO,
+                dry_run: false,
+            });
+        collector.gc_filter = Some(Arc::new(FailRegularDeletes(object_store)));
+        collector
+            .collect(vec![], Duration::ZERO, false)
+            .await
+            .unwrap();
+        assert_eq!(wal_ids(&wal_store).await, vec![1]);
+    }
 
     fn build_table_store() -> Arc<TableStore> {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
