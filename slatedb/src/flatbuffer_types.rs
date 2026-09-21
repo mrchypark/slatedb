@@ -1333,8 +1333,12 @@ impl<'b> DbFlatBufferBuilder<'b> {
             Some(self.builder.create_vector(external_dbs.as_ref()))
         };
 
-        let sequence_tracker_data = core.sequence_tracker.to_bytes();
-        let sequence_tracker = self.builder.create_vector(sequence_tracker_data.as_slice());
+        let sequence_tracker = if core.sequence_tracker.is_empty_with_default_config() {
+            None
+        } else {
+            let data = core.sequence_tracker.to_bytes();
+            Some(self.builder.create_vector(data.as_slice()))
+        };
 
         let manifest = ManifestV2::create(
             &mut self.builder,
@@ -1354,7 +1358,7 @@ impl<'b> DbFlatBufferBuilder<'b> {
                 checkpoints: Some(checkpoints),
                 last_l0_seq: core.last_l0_seq,
                 recent_snapshot_min_seq: core.recent_snapshot_min_seq,
-                sequence_tracker: Some(sequence_tracker),
+                sequence_tracker,
                 segments,
                 segment_extractor_name,
             },
@@ -1710,9 +1714,27 @@ mod tests {
         let bytes = codec.encode(&manifest);
         let wire = flatbuffers::root::<super::ManifestV2>(&bytes[2..]).unwrap();
         assert!(wire.segments().is_none());
+        assert!(wire.sequence_tracker().is_none());
         assert_eq!(codec.decode(&bytes).unwrap(), manifest);
         // The same empty manifest used 130 bytes with an empty segment vector.
         assert!(bytes.len() < 130, "encoded length: {}", bytes.len());
+    }
+
+    #[test]
+    fn test_manifest_v2_keeps_recorded_sequences() {
+        let mut manifest = Manifest::initial(ManifestCore::new());
+        manifest
+            .core
+            .sequence_tracker
+            .insert(crate::seq_tracker::TrackedSeq {
+                seq: 1,
+                ts: DateTime::from_timestamp(1000, 0).unwrap(),
+            });
+        let codec = FlatBufferManifestCodec {};
+        let bytes = codec.encode(&manifest);
+        let wire = flatbuffers::root::<super::ManifestV2>(&bytes[2..]).unwrap();
+        assert!(wire.sequence_tracker().is_some());
+        assert_eq!(codec.decode(&bytes).unwrap(), manifest);
     }
 
     #[test]

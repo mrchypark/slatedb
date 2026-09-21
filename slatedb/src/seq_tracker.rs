@@ -184,6 +184,15 @@ impl SequenceTracker {
         }
     }
 
+    /// Whether an absent manifest field can restore this tracker without loss.
+    pub(crate) fn is_empty_with_default_config(&self) -> bool {
+        self.sequence_numbers.is_empty()
+            && self.timestamps.is_empty()
+            && self.capacity == DEFAULT_CAPACITY
+            && self.interval_secs == DEFAULT_INTERVAL_SECS
+            && self.last_recorded_ts.is_none()
+    }
+
     /// Serialize the tracker into bytes using the RFC-0012 format.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         encode_sequence_tracker(self)
@@ -445,6 +454,37 @@ const GORILLA_PREFIX_BYTES: [u8; 5] = [0, 7, 9, 12, 32];
 mod tests {
     use super::*;
     use rstest::*;
+
+    #[test]
+    fn only_empty_default_tracker_can_be_omitted() {
+        assert!(SequenceTracker::new().is_empty_with_default_config());
+        assert!(
+            !SequenceTracker::with_config(10, DEFAULT_INTERVAL_SECS).is_empty_with_default_config()
+        );
+        assert!(!SequenceTracker::with_config(DEFAULT_CAPACITY, 1).is_empty_with_default_config());
+        let mut tracker = SequenceTracker::new();
+        tracker.insert(TrackedSeq {
+            seq: 1,
+            ts: DateTime::from_timestamp(1000, 0).unwrap(),
+        });
+        assert!(!tracker.is_empty_with_default_config());
+        let mut tracker = SequenceTracker::new();
+        tracker.last_recorded_ts = Some(1000);
+        assert!(!tracker.is_empty_with_default_config());
+    }
+
+    #[test]
+    fn manifest_keeps_non_default_empty_tracker() {
+        use crate::flatbuffer_types::{FlatBufferManifestCodec, ManifestV2};
+        use crate::manifest::{Manifest, ManifestCore};
+        use slatedb_txn_obj::ObjectCodec;
+
+        let mut manifest = Manifest::initial(ManifestCore::new());
+        manifest.core.sequence_tracker = SequenceTracker::with_config(10, 1);
+        let bytes = FlatBufferManifestCodec {}.encode(&manifest);
+        let wire = flatbuffers::root::<ManifestV2>(&bytes[2..]).unwrap();
+        assert!(wire.sequence_tracker().is_some());
+    }
 
     #[test]
     fn should_track_sequence_timestamp_pairs() {
