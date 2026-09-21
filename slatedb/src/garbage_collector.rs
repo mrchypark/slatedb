@@ -128,7 +128,11 @@ impl MessageHandler<GcMessage> for GarbageCollector {
                 Box::new(|| GcMessage::Wal),
             ));
         }
-        if let Some(opts) = self.options.wal_fence_options {
+        if let Some(opts) = self
+            .options
+            .wal_fence_options
+            .filter(|_| self.wal_fence_gc_task.is_some())
+        {
             tickers.push(MessageTickerDef::new(
                 opts.interval.unwrap_or(DEFAULT_INTERVAL),
                 Box::new(|| GcMessage::WalFence),
@@ -248,15 +252,27 @@ impl GarbageCollector {
             closed_result,
             system_clock.clone(),
         ));
+        // Combine native WAL policies only when their schedules match.
+        let combined_fence_options = options.wal_fence_options.filter(|fence| {
+            wal_gc.is_none()
+                && options.wal_options.is_some_and(|regular| {
+                    regular.interval.unwrap_or(DEFAULT_INTERVAL)
+                        == fence.interval.unwrap_or(DEFAULT_INTERVAL)
+                })
+        });
         let wal_gc_task = options.wal_options.map(|wal_options| {
             let wal_gc = wal_gc.unwrap_or_else(|| {
-                Arc::new(SlateDbWalGc::new(
+                let mut collector = SlateDbWalGc::new(
                     wal_store.clone(),
                     stats.clone(),
                     WalGcMode::Regular,
                     gc_filter.clone(),
                     system_clock.clone(),
-                ))
+                );
+                if let Some(fence_options) = combined_fence_options {
+                    collector = collector.with_fence_options(fence_options);
+                }
+                Arc::new(collector)
             });
             WalGcTask::new(
                 manifest_store.clone(),
@@ -266,22 +282,25 @@ impl GarbageCollector {
                 wal_options.dry_run,
             )
         });
-        let wal_fence_gc_task = options.wal_fence_options.map(|wal_fence_options| {
-            let wal_gc = Arc::new(SlateDbWalGc::new(
-                wal_store,
-                stats.clone(),
-                WalGcMode::Fence,
-                gc_filter.clone(),
-                system_clock.clone(),
-            ));
-            WalGcTask::new(
-                manifest_store.clone(),
-                wal_gc,
-                WalGcMode::Fence.resource(),
-                wal_fence_options.min_age,
-                wal_fence_options.dry_run,
-            )
-        });
+        let wal_fence_gc_task = options
+            .wal_fence_options
+            .filter(|_| combined_fence_options.is_none())
+            .map(|wal_fence_options| {
+                let wal_gc = Arc::new(SlateDbWalGc::new(
+                    wal_store,
+                    stats.clone(),
+                    WalGcMode::Fence,
+                    gc_filter.clone(),
+                    system_clock.clone(),
+                ));
+                WalGcTask::new(
+                    manifest_store.clone(),
+                    wal_gc,
+                    WalGcMode::Fence.resource(),
+                    wal_fence_options.min_age,
+                    wal_fence_options.dry_run,
+                )
+            });
         let compacted_gc_task = options.compacted_options.map(|compacted_options| {
             CompactedGcTask::new(
                 manifest_store.clone(),
@@ -499,6 +518,73 @@ mod tests {
         },
         tablestore::TableStore,
     };
+
+    #[test]
+    fn test_native_wal_gc_combines_only_matching_schedules() {
+        struct CustomWalGc;
+        #[async_trait]
+        impl WalGc for CustomWalGc {
+            async fn collect(
+                &self,
+                _: Vec<crate::wal::WalFileRange>,
+                _: Duration,
+                _: bool,
+            ) -> Result<(), crate::wal::WalError> {
+                Ok(())
+            }
+        }
+        let policy = |interval| GarbageCollectorDirectoryOptions {
+            interval,
+            min_age: Duration::ZERO,
+            dry_run: false,
+        };
+        for (regular, fence, custom, expected_tickers, combined) in [
+            (Some(policy(None)), Some(policy(None)), false, 1, true),
+            (
+                Some(policy(None)),
+                Some(policy(Some(DEFAULT_INTERVAL))),
+                false,
+                1,
+                true,
+            ),
+            (
+                Some(policy(Some(Duration::from_secs(13)))),
+                Some(policy(Some(Duration::from_secs(13)))),
+                false,
+                1,
+                true,
+            ),
+            (
+                Some(policy(Some(Duration::from_secs(11)))),
+                Some(policy(Some(Duration::from_secs(13)))),
+                false,
+                2,
+                false,
+            ),
+            (Some(policy(None)), Some(policy(None)), true, 2, false),
+            (None, Some(policy(None)), false, 1, false),
+            (Some(policy(None)), None, false, 1, false),
+        ] {
+            let options = GarbageCollectorOptions {
+                manifest_options: None,
+                wal_options: regular,
+                wal_fence_options: fence,
+                compacted_options: None,
+                compactions_options: None,
+                detach_options: None,
+                ..GarbageCollectorOptions::default()
+            };
+            let mut builder =
+                GarbageCollectorBuilder::new("/", Arc::new(object_store::memory::InMemory::new()))
+                    .with_options(options);
+            if custom {
+                builder = builder.with_wal_gc(Arc::new(CustomWalGc));
+            }
+            let mut gc = builder.build();
+            assert_eq!(gc.tickers().len(), expected_tickers);
+            assert_eq!(gc.wal_fence_gc_task.is_some(), fence.is_some() && !combined);
+        }
+    }
 
     struct LocationGcFilter {
         allowed_locations: HashSet<Path>,
@@ -1369,8 +1455,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_regular_and_wal_fence_gc_run_independently() {
-        let (manifest_store, compactions_store, table_store, wal_store, local_object_store) =
+        let (manifest_store, compactions_store, table_store, _, local_object_store) =
             build_objects();
+        let wal_object_store = Arc::new(crate::test_utils::FlakyObjectStore::new(
+            local_object_store.clone(),
+            0,
+        ));
+        let wal_store = Arc::new(WalTableStore::new(
+            wal_object_store.clone(),
+            SsTableFormat::default(),
+            Path::from("/"),
+            TableStoreKind::GC,
+        ));
         let path_resolver = PathResolver::from_root("/");
 
         let old_fence_id = WalFileId::from(1);
@@ -1444,7 +1540,9 @@ mod tests {
             None,
         );
 
+        let before = wal_object_store.list_attempts();
         gc.run_gc_once().await;
+        assert_eq!(wal_object_store.list_attempts() - before, 1);
 
         let wal_ssts = wal_store.list_wal_ssts(..).await.unwrap();
         assert_eq!(wal_ssts.len(), 1);
