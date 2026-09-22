@@ -548,6 +548,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         ));
         let latest_manifest =
             StoredManifest::try_load(manifest_store.clone(), system_clock.clone()).await?;
+        let fresh_database = latest_manifest.is_none();
 
         if let Some(latest_manifest) = &latest_manifest {
             latest_manifest
@@ -784,6 +785,7 @@ impl<P: Into<Path>> DbBuilder<P> {
 
         // Same store selection as the compactor above. Sharing the DB's cache
         // also means an SST deleted by the GC has its cache entries evicted.
+        let custom_gc_builder = self.gc_builder.is_some();
         let gc_builder = self.gc_builder.or_else(|| {
             self.settings
                 .garbage_collector_options
@@ -823,6 +825,11 @@ impl<P: Into<Path>> DbBuilder<P> {
                     compactions_store.clone(),
                     gc_object_store,
                 );
+            let gc = if fresh_database && !custom_gc_builder {
+                gc.defer_fresh_database_initial_ticks()
+            } else {
+                gc
+            };
             // Garbage collector only uses tickers, so pass in a dummy rx channel
             let (_, rx) = async_channel::unbounded();
             let gc_handle = self.gc_runtime.as_ref().unwrap_or(&tokio_handle);
@@ -2336,6 +2343,61 @@ mod tests {
 
         assert!(called.load(Ordering::Relaxed));
         db.close().await.expect("failed to close db");
+    }
+
+    #[tokio::test]
+    async fn fresh_db_defers_gc_but_next_interval_and_reopen_run_gc() {
+        use slatedb_common::clock::{MockSystemClock, SystemClock};
+        use std::time::Duration;
+
+        let path = "fresh_db_defers_gc_but_next_interval_and_reopen_run_gc";
+        let store = Arc::new(InMemory::new());
+        let clock = Arc::new(MockSystemClock::new());
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let gc_lists = |recorder: &DefaultMetricsRecorder| {
+            lookup_metric_with_labels(
+                recorder,
+                OBJECT_STORE_REQUEST_COUNT,
+                &object_store_labels("gc", "main", "get", "list"),
+            )
+            .unwrap_or(0)
+        };
+        let db = crate::Db::builder(path, store.clone())
+            .with_system_clock(clock.clone())
+            .with_metrics_recorder(recorder.clone())
+            .build()
+            .await
+            .unwrap();
+        // Let the immediate ticks drain without advancing the mock clock.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gc_lists(&recorder), 0);
+        clock.advance(Duration::from_secs(601)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gc_lists(&recorder) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fresh database must collect on the next interval");
+        db.close().await.unwrap();
+
+        let reopened_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let reopened = crate::Db::builder(path, store)
+            .with_system_clock(clock)
+            .with_metrics_recorder(reopened_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while gc_lists(&reopened_recorder) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reopened database must collect without advancing time");
+        reopened.close().await.unwrap();
     }
 
     #[tokio::test]

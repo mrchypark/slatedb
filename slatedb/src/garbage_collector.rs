@@ -108,6 +108,7 @@ pub struct GarbageCollector {
     compacted_gc_task: Option<CompactedGcTask>,
     compactions_gc_task: Option<CompactionsGcTask>,
     detach_gc_task: Option<DetachGcTask>,
+    deferred_initial_ticks: u8,
 }
 
 #[async_trait]
@@ -160,6 +161,9 @@ impl MessageHandler<GcMessage> for GarbageCollector {
     }
 
     async fn handle(&mut self, message: GcMessage) -> Result<(), SlateDBError> {
+        if self.take_deferred_initial_tick(&message) {
+            return Ok(());
+        }
         match message {
             GcMessage::Manifest => {
                 let task = self
@@ -348,7 +352,55 @@ impl GarbageCollector {
             compacted_gc_task,
             compactions_gc_task,
             detach_gc_task,
+            deferred_initial_ticks: 0,
         }
+    }
+
+    /// A newly created manifest has no historical owned garbage. Avoid racing
+    /// open/close with its first immediate background ticks. Reopened databases
+    /// and standalone/manual collectors must retain immediate catch-up.
+    /// Failed-bootstrap orphan objects are still collected on the next interval
+    /// (or the next reopen); no deletion policy or recurring interval changes.
+    pub(crate) fn defer_fresh_database_initial_ticks(mut self) -> Self {
+        let policies = [
+            self.options.manifest_options,
+            self.options.wal_options,
+            self.options.wal_fence_options,
+            self.options.compacted_options,
+            self.options.compactions_options,
+        ];
+        for (index, policy) in policies.into_iter().enumerate() {
+            if policy.is_some_and(|policy| !policy.min_age.is_zero()) {
+                self.deferred_initial_ticks |= 1 << index;
+            }
+        }
+        if self.wal_fence_gc_task.is_none()
+            && self
+                .options
+                .wal_fence_options
+                .is_some_and(|policy| policy.min_age.is_zero())
+        {
+            // A combined WAL pass must honor either policy's immediate cleanup.
+            self.deferred_initial_ticks &= !(1 << 1);
+        }
+        // A fresh manifest cannot reference a clone parent to detach from.
+        self.deferred_initial_ticks |= 1 << 5;
+        self
+    }
+
+    fn take_deferred_initial_tick(&mut self, message: &GcMessage) -> bool {
+        let bit = 1
+            << match message {
+                GcMessage::Manifest => 0,
+                GcMessage::Wal => 1,
+                GcMessage::WalFence => 2,
+                GcMessage::Compacted => 3,
+                GcMessage::Compactions => 4,
+                GcMessage::Detach => 5,
+            };
+        let deferred = self.deferred_initial_ticks & bit != 0;
+        self.deferred_initial_ticks &= !bit;
+        deferred
     }
 
     /// Starts the garbage collector. This method runs the recurring garbage
@@ -515,6 +567,42 @@ mod tests {
         },
         tablestore::TableStore,
     };
+
+    #[test]
+    fn fresh_database_defers_only_one_background_tick_per_task() {
+        let build = || {
+            GarbageCollectorBuilder::new("/fresh", Arc::new(object_store::memory::InMemory::new()))
+                .build()
+        };
+        let mut ordinary = build();
+        let mut fresh = build().defer_fresh_database_initial_ticks();
+        for message in [
+            GcMessage::Manifest,
+            GcMessage::Wal,
+            GcMessage::WalFence,
+            GcMessage::Compacted,
+            GcMessage::Compactions,
+            GcMessage::Detach,
+        ] {
+            assert!(!ordinary.take_deferred_initial_tick(&message));
+            assert!(fresh.take_deferred_initial_tick(&message));
+            assert!(!fresh.take_deferred_initial_tick(&message));
+        }
+    }
+
+    #[test]
+    fn fresh_database_keeps_zero_age_combined_wal_gc_immediate() {
+        let mut options = GarbageCollectorOptions::default();
+        options.wal_fence_options.as_mut().unwrap().min_age = Duration::ZERO;
+        let mut fresh =
+            GarbageCollectorBuilder::new("/fresh", Arc::new(object_store::memory::InMemory::new()))
+                .with_options(options)
+                .build()
+                .defer_fresh_database_initial_ticks();
+        assert!(fresh.wal_fence_gc_task.is_none());
+        assert!(!fresh.take_deferred_initial_tick(&GcMessage::Wal));
+        assert!(!fresh.take_deferred_initial_tick(&GcMessage::WalFence));
+    }
 
     #[test]
     fn test_native_wal_gc_combines_only_matching_schedules() {
